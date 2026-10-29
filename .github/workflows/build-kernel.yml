@@ -81,6 +81,9 @@ jobs:
           git remote add origin "$KERNEL_REPO"
           git fetch -q --depth 1 origin "$KERNEL_COMMIT"
           git checkout -q FETCH_HEAD
+          # scripts/setlocalversion 在 HEAD 不是 tag 时会追加 "+"，
+          # 导致 vermagic 变成 ...-gdb39b3851f98+。空的 .scmversion 可屏蔽该行为。
+          : > .scmversion
           echo "HEAD: $(git rev-parse HEAD)"
           head -5 Makefile
 
@@ -136,6 +139,10 @@ jobs:
             exit 1
           fi
           strings arch/arm64/boot/Image | grep -m3 "$EXPECTED_RELEASE" || true
+          if strings arch/arm64/boot/Image | grep -q "${EXPECTED_RELEASE}+"; then
+            echo "::error::Image 里出现 ${EXPECTED_RELEASE}+，setlocalversion 又追加了加号"
+            exit 1
+          fi
           echo "OK: vermagic 匹配"
           echo "=== 确认 KSU 已编入 ==="
           if strings arch/arm64/boot/Image | grep -qi "kernelsu\|ksu_"; then
