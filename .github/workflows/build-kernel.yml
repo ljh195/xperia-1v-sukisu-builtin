@@ -1,0 +1,154 @@
+name: Build SukiSU builtin kernel (pdx234)
+
+# 目标设备：Sony Xperia 1 V (XQ-DQ72 / pdx234)
+# 系统：LineageOS 24.0 NIGHTLY 24.0-20261025-NIGHTLY-pdx234
+# 内核：5.15.211-gdb39b3851f98 (GKI 5.15, commit db39b3851f98)
+#
+# 把 SukiSU Ultra 直接编进内核 (CONFIG_KSU=y)，产出 Image，
+# 并用官方 boot.img 作为模板重打包成可直接 fastboot 刷入的 boot.img。
+#
+# 关键：vermagic 必须与设备完全一致，否则 364 个 vendor .ko 全部加载失败。
+# 因此固定 LOCALVERSION="-gdb39b3851f98" 且关闭 LOCALVERSION_AUTO。
+# 工具链使用 clang 22（设备内核为 clang 22.0.2），避免 CFI 类型哈希不一致。
+#
+# 只刷 boot，不碰 init_boot。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+env:
+  KERNEL_REPO: https://github.com/LineageOS/android_kernel_sony_sm8550.git
+  KERNEL_COMMIT: db39b3851f981d5ef933437758e662cfa272a007
+  SUKISU_REPO: https://github.com/SukiSU-Ultra/SukiSU-Ultra.git
+  SUKISU_TAG: v4.2.1-r2          # 与手机上已安装的 SukiSU Manager v4.2.1-r2 对应
+  BOOT_URL: https://mirrorbits.lineageos.org/full/pdx234/20261025/boot.img
+  LOCALVER: "-gdb39b3851f98"
+  EXPECTED_RELEASE: "5.15.211-gdb39b3851f98"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/lib/jvm /usr/local/.ghcup 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Install LLVM 22 (match device clang 22.0.2)
+        run: |
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 22
+          echo "/usr/lib/llvm-22/bin" >> $GITHUB_PATH
+          export PATH="/usr/lib/llvm-22/bin:$PATH"
+          clang --version
+          ld.lld --version
+          llvm-ar --version | head -1
+          which clang ld.lld llvm-nm llvm-objcopy llvm-strip llvm-readelf
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev libncurses-dev \
+            zip unzip cpio rsync python3 perl git curl wget ca-certificates \
+            dwarves zstd lz4 kmod device-tree-compiler
+          pahole --version
+
+      - name: Fetch kernel source at exact device commit
+        run: |
+          mkdir kernel && cd kernel
+          git init -q
+          git remote add origin "$KERNEL_REPO"
+          git fetch -q --depth 1 origin "$KERNEL_COMMIT"
+          git checkout -q FETCH_HEAD
+          echo "HEAD: $(git rev-parse HEAD)"
+          head -5 Makefile
+
+      - name: Apply SukiSU (builtin mode)
+        run: |
+          git clone -q "$SUKISU_REPO" sukisu-src
+          git -C sukisu-src checkout -q "$SUKISU_TAG"
+          echo "SukiSU: $(git -C sukisu-src describe --tags --always)"
+          cd kernel
+          # setup.sh 必须以内核根目录为 cwd 运行：它会把 KernelSU 克隆到 ./KernelSU
+          # 并创建 drivers/kernelsu 符号链接、往 drivers/Makefile 与 Kconfig 注入条目
+          sh ../sukisu-src/kernel/setup.sh "$SUKISU_TAG"
+          echo "--- 注入结果 ---"
+          ls -l drivers/kernelsu
+          grep -n kernelsu drivers/Makefile drivers/Kconfig
+
+      - name: Configure kernel
+        run: |
+          cd kernel
+          cp ../configs/pdx234.config .config
+          ./scripts/config --enable KSU
+          ./scripts/config --enable KSU_MANUAL_SU
+          ./scripts/config --disable KSU_DEBUG
+          ./scripts/config --set-str LOCALVERSION "$LOCALVER"
+          ./scripts/config --disable LOCALVERSION_AUTO
+          make ARCH=arm64 LLVM=1 olddefconfig
+          echo "=== 关键配置 ==="
+          grep -E "^CONFIG_(KSU|KSU_MANUAL_SU|LOCALVERSION|LOCALVERSION_AUTO|MODVERSIONS|MODULE_SIG|MODULE_SIG_FORCE|LTO_CLANG_FULL|CFI_CLANG|KPROBES|EXT4_FS)=" .config || true
+          echo "=== kernel.release ==="
+          cat include/config/kernel.release
+
+      - name: Build Image
+        run: |
+          set -o pipefail
+          cd kernel
+          if ! make ARCH=arm64 LLVM=1 -j"$(nproc)" Image 2>&1 | tee /tmp/build.log; then
+            echo "::warning::首次编译失败，关闭 CONFIG_WERROR 后重试"
+            tail -120 /tmp/build.log
+            ./scripts/config --disable WERROR
+            make ARCH=arm64 LLVM=1 olddefconfig
+            make ARCH=arm64 LLVM=1 -j"$(nproc)" Image 2>&1 | tee /tmp/build.log
+          fi
+          ls -lh arch/arm64/boot/Image
+
+      - name: Verify vermagic
+        run: |
+          cd kernel
+          RELEASE=$(cat include/config/kernel.release)
+          echo "kernel.release = $RELEASE"
+          echo "期望 = $EXPECTED_RELEASE"
+          if [ "$RELEASE" != "$EXPECTED_RELEASE" ]; then
+            echo "::error::kernel.release 与设备不一致，vendor 模块会全部加载失败"
+            exit 1
+          fi
+          strings arch/arm64/boot/Image | grep -m3 "$EXPECTED_RELEASE" || true
+          echo "OK: vermagic 匹配"
+          echo "=== 确认 KSU 已编入 ==="
+          if strings arch/arm64/boot/Image | grep -qi "kernelsu\|ksu_"; then
+            echo "OK: 镜像含 KernelSU 符号/字符串"
+          else
+            echo "::warning::未在 Image 中找到 KernelSU 痕迹，请人工确认"
+          fi
+
+      - name: Repack boot image
+        run: |
+          curl -fsSL "$BOOT_URL" -o boot-stock.img
+          ls -lh boot-stock.img
+          sha256sum boot-stock.img
+          python3 scripts/repack_boot.py boot-stock.img kernel/arch/arm64/boot/Image boot-new.img
+          ls -lh boot-new.img
+          python3 scripts/verify_boot.py boot-new.img
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdx234-kernelsu-builtin
+          path: |
+            kernel/arch/arm64/boot/Image
+            kernel/include/config/kernel.release
+            boot-new.img
+          retention-days: 90
