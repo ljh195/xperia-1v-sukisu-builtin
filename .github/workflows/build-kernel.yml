@@ -43,6 +43,15 @@ jobs:
           sudo apt-get clean
           df -h /
 
+      - name: Create swap (full LTO link needs way more than 16 GB RAM)
+        run: |
+          sudo fallocate -l 40G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap -q /swapfile
+          sudo swapon /swapfile
+          free -h
+          df -h /
+
       - name: Install LLVM 22 (match device clang 22.0.2)
         run: |
           wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
