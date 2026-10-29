@@ -100,7 +100,7 @@ jobs:
           echo "=== 关键配置 ==="
           grep -E "^CONFIG_(KSU|KSU_MANUAL_SU|LOCALVERSION|LOCALVERSION_AUTO|MODVERSIONS|MODULE_SIG|MODULE_SIG_FORCE|LTO_CLANG_FULL|CFI_CLANG|KPROBES|EXT4_FS)=" .config || true
           echo "=== kernel.release ==="
-          cat include/config/kernel.release
+          make -s ARCH=arm64 LLVM=1 kernelrelease
 
       - name: Build Image
         run: |
@@ -118,7 +118,7 @@ jobs:
       - name: Verify vermagic
         run: |
           cd kernel
-          RELEASE=$(cat include/config/kernel.release)
+          RELEASE=$(make -s ARCH=arm64 LLVM=1 kernelrelease)
           echo "kernel.release = $RELEASE"
           echo "期望 = $EXPECTED_RELEASE"
           if [ "$RELEASE" != "$EXPECTED_RELEASE" ]; then
@@ -149,6 +149,5 @@ jobs:
           name: pdx234-kernelsu-builtin
           path: |
             kernel/arch/arm64/boot/Image
-            kernel/include/config/kernel.release
             boot-new.img
           retention-days: 90
