@@ -36,8 +36,10 @@ env:
   EXPECTED_RELEASE: "5.15.211-gdb39b3851f98"
   KSU_VER: "41100"
   KSU_VER_FULL: "v4.3.0-d6b36700@HEAD"
-  # kernel/preinit 在 SUSFS 模式下不参与编译；全局定义可让 fs/exec.c 跳过对 preinit 的引用
-  KCFLAGS: "-DKSU_NO_PREINIT"
+  # 注意：不要全局定义 KSU_NO_PREINIT。
+  # 该内核构建时 objtree/usr/include 存在，SukiSU 会自动编译 preinit/preinit.c
+  # 并由 fs/exec.c 的手工 hook 调用；全局定义会让 preinit.h 输出 stub，
+  # 与 preinit.c 的真实定义冲突（redefinition）。
 
 jobs:
   build:
