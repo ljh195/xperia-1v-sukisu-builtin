@@ -1,31 +1,43 @@
-name: Build SukiSU builtin kernel (pdx234)
+name: Build SukiSU+SUSFS kernel (pdx234)
 
 # 目标设备：Sony Xperia 1 V (XQ-DQ72 / pdx234)
 # 系统：LineageOS 24.0 NIGHTLY 24.0-20261025-NIGHTLY-pdx234
 # 内核：5.15.211-gdb39b3851f98 (GKI 5.15, commit db39b3851f98)
 #
-# 把 SukiSU Ultra 直接编进内核 (CONFIG_KSU=y)，产出 Image，
-# 并用官方 boot.img 作为模板重打包成可直接 fastboot 刷入的 boot.img。
+# 在原「内置 SukiSU」基础上叠加 SUSFS v2.3.0：
+#   - SukiSU 使用 builtin 分支（SUSFS 只支持该分支，手工 hook 由 SUSFS 补丁自带）
+#   - SUSFS 内核主补丁 50_add_susfs_in_kernel.patch 对本内核零冲突
+#   - 51_fix_sukisu_builtin_compat.patch 修正补丁与 builtin 分支的两处类型/签名不一致
 #
-# 关键：vermagic 必须与设备完全一致，否则 364 个 vendor .ko 全部加载失败。
-# 因此固定 LOCALVERSION="-gdb39b3851f98" 且关闭 LOCALVERSION_AUTO。
-# 工具链使用 clang 22（设备内核为 clang 22.0.2），避免 CFI 类型哈希不一致。
-#
-# 只刷 boot，不碰 init_boot。
+# 关键约束：
+#   - vermagic 必须与设备完全一致，否则 335 个 vendor .ko 全部加载失败
+#   - /proc/version 伪装成原厂构建（相同的 CC/LD 版本串、构建用户、主机、时间戳）
+#   - 只刷 boot，绝不碰 init_boot
 
 on:
   workflow_dispatch:
   push:
     branches: [ main ]
+    paths:
+      - '.github/workflows/build-kernel.yml'
+      - 'patches/**'
+      - 'susfs/**'
+      - 'configs/**'
+      - 'scripts/**'
 
 env:
   KERNEL_REPO: https://github.com/LineageOS/android_kernel_sony_sm8550.git
   KERNEL_COMMIT: db39b3851f981d5ef933437758e662cfa272a007
-  SUKISU_REPO: https://github.com/SukiSU-Ultra/SukiSU-Ultra.git
-  SUKISU_TAG: v4.2.1-r2          # 与手机上已安装的 SukiSU Manager v4.2.1-r2 对应
+  SUKISU_REPO: SukiSU-Ultra/SukiSU-Ultra
+  # builtin 分支 2026-10-29 的 HEAD
+  SUKISU_COMMIT: b16e899a555e9b96aa1225f049cd7274820ca5b8
   BOOT_URL: https://mirrorbits.lineageos.org/full/pdx234/20261025/boot.img
   LOCALVER: "-gdb39b3851f98"
   EXPECTED_RELEASE: "5.15.211-gdb39b3851f98"
+  KSU_VER: "41100"
+  KSU_VER_FULL: "v4.3.0-d6b36700@HEAD"
+  # kernel/preinit 在 SUSFS 模式下不参与编译；全局定义可让 fs/exec.c 跳过对 preinit 的引用
+  KCFLAGS: "-DKSU_NO_PREINIT"
 
 jobs:
   build:
@@ -62,8 +74,6 @@ jobs:
           export PATH="/usr/lib/llvm-22/bin:$PATH"
           clang --version
           ld.lld --version
-          llvm-ar --version | head -1
-          which clang ld.lld llvm-nm llvm-objcopy llvm-strip llvm-readelf
 
       - name: Install build dependencies
         run: |
@@ -81,75 +91,187 @@ jobs:
           git remote add origin "$KERNEL_REPO"
           git fetch -q --depth 1 origin "$KERNEL_COMMIT"
           git checkout -q FETCH_HEAD
-          # scripts/setlocalversion 在 HEAD 不是 tag 时会追加 "+"，
-          # 导致 vermagic 变成 ...-gdb39b3851f98+。空的 .scmversion 可屏蔽该行为。
           : > .scmversion
           echo "HEAD: $(git rev-parse HEAD)"
           head -5 Makefile
 
-      - name: Apply SukiSU (builtin mode)
+      - name: Fetch SukiSU builtin branch
         run: |
-          git clone -q "$SUKISU_REPO" sukisu-src
-          git -C sukisu-src checkout -q "$SUKISU_TAG"
-          echo "SukiSU: $(git -C sukisu-src describe --tags --always)"
-          cd kernel
-          # setup.sh 必须以内核根目录为 cwd 运行：它会把 KernelSU 克隆到 ./KernelSU
-          # 并创建 drivers/kernelsu 符号链接、往 drivers/Makefile 与 Kconfig 注入条目
-          sh ../sukisu-src/kernel/setup.sh "$SUKISU_TAG"
+          mkdir -p sukisu-src
+          curl -fsSL "https://codeload.github.com/${SUKISU_REPO}/tar.gz/${SUKISU_COMMIT}" \
+            | tar xz -C sukisu-src --strip-components=1
+          test -f sukisu-src/kernel/Kconfig
+          grep -q 'config KSU_SUSFS' sukisu-src/kernel/Kconfig
+          echo "SukiSU builtin OK"
+          sed -n '30,45p' sukisu-src/kernel/Kconfig
+
+      - name: Integrate SukiSU into kernel tree
+        run: |
+          cp -r sukisu-src/kernel kernel/drivers/kernelsu
+          # drivers/Makefile: 挂上 kernelsu 子目录
+          grep -q 'obj-$(CONFIG_KSU) += kernelsu/' kernel/drivers/Makefile || \
+            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> kernel/drivers/Makefile
+          # drivers/Kconfig: 注入 Kconfig 源
+          grep -q 'drivers/kernelsu/Kconfig' kernel/drivers/Kconfig || \
+            sed -i '/^endmenu$/i source "drivers/kernelsu/Kconfig"' kernel/drivers/Kconfig
           echo "--- 注入结果 ---"
-          ls -l drivers/kernelsu
-          grep -n kernelsu drivers/Makefile drivers/Kconfig
+          ls -ld kernel/drivers/kernelsu
+          tail -3 kernel/drivers/Makefile
+          grep -n kernelsu kernel/drivers/Kconfig
+
+      - name: Apply SUSFS patch + compatibility fix
+        run: |
+          cd kernel
+          cp -v ../susfs/fs/susfs.c fs/susfs.c
+          cp -v ../susfs/include/linux/susfs.h include/linux/susfs.h
+          cp -v ../susfs/include/linux/susfs_def.h include/linux/susfs_def.h
+          patch -p1 -F0 --no-backup-if-mismatch < ../patches/50_add_susfs_in_kernel.patch
+          patch -p1 -F0 --no-backup-if-mismatch < ../patches/51_fix_sukisu_builtin_compat.patch
+          echo "=== SUSFS 版本 ==="
+          grep -m1 SUSFS_VERSION include/linux/susfs.h
+          echo "=== 关键 hook 落点 ==="
+          grep -n 'ksu_handle_faccessat(&dfd' fs/open.c
+          grep -n 'ksu_handle_stat(&dfd' fs/stat.c
+          grep -n 'ksu_handle_execveat' fs/exec.c | head -4
+          grep -n 'ksu_handle_sys_reboot' kernel/reboot.c
+
+      - name: Mask build fingerprint in /proc/version
+        run: |
+          cd kernel
+          # include/generated/compile.h 由 scripts/mkcompile_h 生成，
+          # 这里把编译器/链接器版本串固定成原厂构建使用的值。
+          python3 - <<'PY'
+          p = 'scripts/mkcompile_h'
+          s = open(p).read()
+          marker = "printf '#define LINUX_COMPILER"
+          assert s.count(marker) == 1, "mkcompile_h 结构不符预期"
+          fake = (
+              'CC_VERSION="Android (15071444, +pgo, +bolt, +lto, +mlgo, based on r596125) '
+              'clang version 22.0.2 (https://android.googlesource.com/toolchain/llvm-project '
+              'de03d430485c884861198b25459851f429cbdbad)"\n'
+              'LD_VERSION="LLD 22.0.2 (/mnt/disks/build-disk/src/googleplex-android/'
+              'llvm-r596125-release/out/llvm-project/llvm '
+              'de03d430485c884861198b25459851f429cbdbad)"\n'
+          )
+          s = s.replace(marker, fake + marker, 1)
+          open(p, 'w').write(s)
+          print("mkcompile_h patched")
+          PY
 
       - name: Configure kernel
         run: |
           cd kernel
           cp ../configs/pdx234.config .config
+          # SukiSU
           ./scripts/config --enable KSU
           ./scripts/config --enable KSU_MANUAL_SU
+          ./scripts/config --enable KSU_FEATURE_ADBROOT
           ./scripts/config --disable KSU_DEBUG
+          ./scripts/config --disable KPM
+          # SUSFS 及全部子功能
+          ./scripts/config --enable KSU_SUSFS
+          ./scripts/config --enable KSU_SUSFS_SUS_PATH
+          ./scripts/config --enable KSU_SUSFS_SUS_MOUNT
+          ./scripts/config --enable KSU_SUSFS_SUS_KSTAT
+          ./scripts/config --enable KSU_SUSFS_SPOOF_UNAME
+          ./scripts/config --enable KSU_SUSFS_ENABLE_LOG
+          ./scripts/config --enable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+          ./scripts/config --enable KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          ./scripts/config --enable KSU_SUSFS_OPEN_REDIRECT
+          ./scripts/config --enable KSU_SUSFS_SUS_MAP
+          # vermagic
           ./scripts/config --set-str LOCALVERSION "$LOCALVER"
           ./scripts/config --disable LOCALVERSION_AUTO
           make ARCH=arm64 LLVM=1 olddefconfig
-          echo "=== 关键配置 ==="
-          grep -E "^CONFIG_(KSU|KSU_MANUAL_SU|LOCALVERSION|LOCALVERSION_AUTO|MODVERSIONS|MODULE_SIG|MODULE_SIG_FORCE|LTO_CLANG_FULL|CFI_CLANG|KPROBES|EXT4_FS)=" .config || true
+          echo "=== KSU/SUSFS 配置 ==="
+          grep -E '^CONFIG_(KSU|THREAD_INFO_IN_TASK)' .config
           echo "=== kernel.release ==="
           make -s ARCH=arm64 LLVM=1 kernelrelease
 
+      - name: Sanity check config
+        run: |
+          cd kernel
+          fail=0
+          for c in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH \
+                   CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_KSU_SUSFS_SUS_KSTAT \
+                   CONFIG_KSU_SUSFS_SPOOF_UNAME CONFIG_KSU_SUSFS_SUS_MAP \
+                   CONFIG_KSU_SUSFS_OPEN_REDIRECT \
+                   CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS; do
+            if ! grep -qx "$c=y" .config; then
+              echo "::error::$c 未生效"
+              fail=1
+            fi
+          done
+          exit $fail
+
       - name: Build Image
+        env:
+          KBUILD_BUILD_USER: root
+          KBUILD_BUILD_HOST: 0aef92ffa146
+          KBUILD_BUILD_VERSION: "1"
+          KBUILD_BUILD_TIMESTAMP: "Sun Oct 25 04:19:57 UTC 2026"
         run: |
           set -o pipefail
           cd kernel
-          if ! make ARCH=arm64 LLVM=1 -j"$(nproc)" Image 2>&1 | tee /tmp/build.log; then
+          MAKE_ARGS="ARCH=arm64 LLVM=1 KSU_VERSION=${KSU_VER} KSU_VERSION_FULL=${KSU_VER_FULL}"
+          if ! make $MAKE_ARGS -j"$(nproc)" Image 2>&1 | tee /tmp/build.log; then
             echo "::warning::首次编译失败，关闭 CONFIG_WERROR 后重试"
-            tail -120 /tmp/build.log
+            tail -150 /tmp/build.log
             ./scripts/config --disable WERROR
             make ARCH=arm64 LLVM=1 olddefconfig
-            make ARCH=arm64 LLVM=1 -j"$(nproc)" Image 2>&1 | tee /tmp/build.log
+            make $MAKE_ARGS -j"$(nproc)" Image 2>&1 | tee /tmp/build.log
           fi
           ls -lh arch/arm64/boot/Image
 
-      - name: Verify vermagic
+      - name: Verify vermagic, banner and SUSFS
         run: |
           cd kernel
           RELEASE=$(make -s ARCH=arm64 LLVM=1 kernelrelease)
           echo "kernel.release = $RELEASE"
-          echo "期望 = $EXPECTED_RELEASE"
           if [ "$RELEASE" != "$EXPECTED_RELEASE" ]; then
-            echo "::error::kernel.release 与设备不一致，vendor 模块会全部加载失败"
+            echo "::error::kernel.release 不一致，vendor 模块会全部加载失败"
             exit 1
           fi
-          strings arch/arm64/boot/Image | grep -m3 "$EXPECTED_RELEASE" || true
           if strings arch/arm64/boot/Image | grep -q "${EXPECTED_RELEASE}+"; then
-            echo "::error::Image 里出现 ${EXPECTED_RELEASE}+，setlocalversion 又追加了加号"
+            echo "::error::Image 里出现 ${EXPECTED_RELEASE}+"
             exit 1
           fi
           echo "OK: vermagic 匹配"
-          echo "=== 确认 KSU 已编入 ==="
-          if strings arch/arm64/boot/Image | grep -qi "kernelsu\|ksu_"; then
-            echo "OK: 镜像含 KernelSU 符号/字符串"
+
+          if strings arch/arm64/boot/Image | grep -qi 'susfs'; then
+            echo "OK: 镜像含 SUSFS 符号/字符串"
           else
-            echo "::warning::未在 Image 中找到 KernelSU 痕迹，请人工确认"
+            echo "::error::镜像里找不到 SUSFS 痕迹"
+            exit 1
           fi
+
+          echo "=== /proc/version 指纹 ==="
+          python3 - <<'PY'
+          import sys
+          img = open('arch/arm64/boot/Image','rb').read()
+          i = img.find(b'Linux version 5.15.211')
+          if i < 0:
+              print("::error::Image 里找不到 linux_banner")
+              sys.exit(1)
+          s = img[i:i+600].split(b'\x00')[0].decode('utf-8','replace')
+          print(s)
+          expected = (
+              'Linux version 5.15.211-gdb39b3851f98 (root@0aef92ffa146) '
+              '(Android (15071444, +pgo, +bolt, +lto, +mlgo, based on r596125) '
+              'clang version 22.0.2 (https://android.googlesource.com/toolchain/llvm-project '
+              'de03d430485c884861198b25459851f429cbdbad), '
+              'LLD 22.0.2 (/mnt/disks/build-disk/src/googleplex-android/'
+              'llvm-r596125-release/out/llvm-project/llvm '
+              'de03d430485c884861198b25459851f429cbdbad)) '
+              '#1 SMP PREEMPT Sun Oct 25 04:19:57 UTC 2026\n'
+          )
+          if s == expected.strip('\n'):
+              print("OK: linux_banner 与原厂逐字一致")
+          else:
+              print("::warning::linux_banner 与原厂不一致，请核对上面的内容")
+              print("期望:", repr(expected.strip('\n')))
+              print("实际:", repr(s))
+          PY
 
       - name: Repack boot image
         run: |
@@ -158,12 +280,13 @@ jobs:
           sha256sum boot-stock.img
           python3 scripts/repack_boot.py boot-stock.img kernel/arch/arm64/boot/Image boot-new.img
           ls -lh boot-new.img
+          sha256sum boot-new.img
           python3 scripts/verify_boot.py boot-new.img
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: pdx234-kernelsu-builtin
+          name: pdx234-kernelsu-susfs
           path: |
             kernel/arch/arm64/boot/Image
             boot-new.img

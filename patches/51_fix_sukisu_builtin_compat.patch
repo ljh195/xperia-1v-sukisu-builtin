@@ -1,0 +1,83 @@
+diff -ruN a/fs/exec.c b/fs/exec.c
+--- a/fs/exec.c	2026-10-30 14:15:03.575986314 +0800
++++ b/fs/exec.c	2026-10-30 14:15:09.371419117 +0800
+@@ -1896,7 +1896,7 @@
+ }
+ 
+ #ifdef CONFIG_KSU_SUSFS
+-extern struct static_key_true ksu_su_compat_enabled;
++extern bool ksu_su_compat_enabled;
+ extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
+ extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,
+ 			void *envp, int *flags);
+@@ -1934,7 +1934,7 @@
+ 	if (likely(susfs_is_current_proc_no_su()))
+ 		goto orig_flow;
+ 
+-	if (static_branch_likely(&ksu_su_compat_enabled)) {
++	if (likely(ksu_su_compat_enabled)) {
+ 		if (static_branch_unlikely(&susfs_is_sdcard_android_data_not_decrypted)) {
+ 			is_su_session = !ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+ 		} else {
+diff -ruN a/fs/open.c b/fs/open.c
+--- a/fs/open.c	2026-10-30 14:15:03.578537551 +0800
++++ b/fs/open.c	2026-10-30 14:15:09.371655937 +0800
+@@ -398,7 +398,7 @@
+ }
+ 
+ #ifdef CONFIG_KSU_SUSFS
+-extern struct static_key_true ksu_su_compat_enabled;
++extern bool ksu_su_compat_enabled;
+ extern bool __ksu_is_allow_uid_for_current(uid_t uid);
+ extern int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode, int *__unused_flags);
+ #endif
+@@ -438,7 +438,7 @@
+ 	if (likely(susfs_is_current_proc_no_su()))
+ 		goto orig_flow;
+ 
+-	if (static_branch_likely(&ksu_su_compat_enabled)) {
++	if (likely(ksu_su_compat_enabled)) {
+ 		if (unlikely(__ksu_is_allow_uid_for_current(current_uid().val)))
+ 			ksu_handle_faccessat(&dfd, &fname, &mode, NULL);
+ 	}
+diff -ruN a/fs/read_write.c b/fs/read_write.c
+--- a/fs/read_write.c	2026-10-30 14:15:03.580329702 +0800
++++ b/fs/read_write.c	2026-10-30 14:15:09.372067513 +0800
+@@ -630,14 +630,14 @@
+ 
+ #ifdef CONFIG_KSU_SUSFS
+ extern struct static_key_true ksu_is_init_rc_hook_enabled;
+-extern __attribute__((cold)) void ksu_handle_sys_read(unsigned int fd);
++extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);
+ #endif
+ 
+ SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+ {
+ #ifdef CONFIG_KSU_SUSFS
+ 	if (static_branch_unlikely(&ksu_is_init_rc_hook_enabled))
+-		ksu_handle_sys_read(fd);
++		ksu_handle_sys_read(fd, &buf, &count);
+ #endif
+ 
+ 	return ksys_read(fd, buf, count);
+diff -ruN a/fs/stat.c b/fs/stat.c
+--- a/fs/stat.c	2026-10-30 14:15:03.580831272 +0800
++++ b/fs/stat.c	2026-10-30 14:15:09.371856280 +0800
+@@ -30,7 +30,7 @@
+ #ifdef CONFIG_KSU_SUSFS
+ extern struct static_key_true ksu_is_init_rc_hook_enabled;
+ extern void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr);
+-extern struct static_key_true ksu_su_compat_enabled;
++extern bool ksu_su_compat_enabled;
+ extern bool __ksu_is_allow_uid_for_current(uid_t uid);
+ extern int ksu_handle_stat(int *dfd, struct filename **filename, int *flags);
+ #endif // #ifdef CONFIG_KSU_SUSFS
+@@ -288,7 +288,7 @@
+ 	if (likely(susfs_is_current_proc_no_su()))
+ 		goto orig_flow;
+ 
+-	if (static_branch_likely(&ksu_su_compat_enabled)) {
++	if (likely(ksu_su_compat_enabled)) {
+ 		if (unlikely(__ksu_is_allow_uid_for_current(current_uid().val)))
+ 			ksu_handle_stat(&dfd, &fname, &flags);
+ 	}
